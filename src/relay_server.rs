@@ -53,6 +53,7 @@ pub async fn start_with_bind(
     key: &str,
 ) -> ResultType<()> {
     crate::common::require_service_key(key, &crate::common::get_arg("ALLOW_ANONYMOUS"))?;
+    crate::websocket::validate_config()?;
     let key = get_server_sk(key)?;
     if let Ok(mut file) = std::fs::File::open(BLACKLIST_FILE) {
         let mut contents = String::new();

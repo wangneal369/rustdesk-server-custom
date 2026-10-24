@@ -132,6 +132,7 @@ impl RendezvousServer {
         rmem: usize,
     ) -> ResultType<()> {
         require_service_key(key, &get_arg("ALLOW_ANONYMOUS"))?;
+        crate::websocket::validate_config()?;
         let (key, sk) = Self::get_server_sk(key)?;
         let nat_port = port - 1;
         let ws_port = port + 2;

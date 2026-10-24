@@ -7,13 +7,13 @@
 - hbbs / hbbr 默认拒绝空白 KEY，只有显式 `ALLOW_ANONYMOUS=Y` 才允许空 KEY。Compose、systemd hbbr 参数与 s6 镜像默认值继续采用共享密钥配置。
 - KEY / 公钥匹配不是人员身份认证。原生注册/探测不是所有消息都携带准入凭据；不能据此宣称全量身份认证或封闭设备登记。客户端既有密码、人工确认、可选 2FA、白名单及会话权限检查保持不变。
 - WebSocket 服务入口继续复用客户端已经采用的 tokio-tungstenite / tungstenite 0.29 修补分支，固定为 `c241b11b03de4881faf1ecd2fe6e867c92f3013b` / `efce47e5364f00a63302cf07ab1fb13ded478914`。共享库内部 0.26.2 依赖及两个共享子模块固定提交不变。
-- WebSocket 握手超时 10 秒；默认不信任转发地址，只对 `TRUSTED_PROXIES` 列出的代理解析来源，转发链从右向左停止于首个不可信跳点。
+- WebSocket 握手超时 10 秒；默认不信任转发地址，只对 `TRUSTED_PROXIES` 列出的代理解析来源（配置非法时启动失败），转发链从右向左停止于首个不可信跳点。
 - TCP / WebSocket 准入控制消息限 128 KiB，TCP 超大声明长度在读取正文前拒绝，WebSocket 单帧和分片后的完整消息均受限制。中继通过准入后恢复媒体报文上限；读取缓冲随实际数据增长，不根据远端声明一次性扩张。未宣称限制总连接数或解决全部 DoS。
 - 前阶段 SQLx 0.8.6、libsqlite3-sys 0.30.1、Reqwest 0.12 及其余依赖修补继续保留。本次仅删除不再使用的 Axum 接收端依赖，不回退旧 SQLx / TLS / Hyper 依赖链。Reqwest 仍用于原有版本检查。
 
 ## 仅保留服务端运行日志
 
-沿用 flexi_logger：`LOG_DIR` 默认 `logs`，`RUST_LOG` 默认 `info`；hbbs / hbbr 分别写日志，同时将 info 及以上输出到 stdout。每日或 10 MiB 轮转，保留 31 个历史文件（不保证 31 天）；配置在日志初始化前加载。KEY 原值不写日志。
+沿用 flexi_logger：`LOG_DIR` 默认 `logs`，`RUST_LOG` 默认 `info`；hbbs / hbbr 分别写日志，同时将通过 `RUST_LOG` 的日志输出到 stdout；`LOG_DIR` 不可写时告警并退回仅 stdout，不阻止启动。每日或 10 MiB 轮转，保留 31 个历史文件（不保证 31 天）；配置在日志初始化前加载。KEY 原值不写日志。
 
 保留启动、异常、连接及认证失败等原有日志。这些日志用于运行排障，不提供人员操作追责、文件操作审计或屏幕内容记录。日志访问权限、磁盘空间、备份和留存由部署方管理。
 

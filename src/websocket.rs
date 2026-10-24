@@ -32,6 +32,11 @@ pub async fn accept(
     Ok((stream, peer_addr))
 }
 
+// Called at startup so a bad TRUSTED_PROXIES fails fast instead of breaking every handshake.
+pub fn validate_config() -> ResultType<()> {
+    parse_trusted_proxies(&get_arg("TRUSTED_PROXIES")).map(|_| ())
+}
+
 fn parse_trusted_proxies(value: &str) -> ResultType<Vec<IpNetwork>> {
     value.split(',')
         .map(str::trim)

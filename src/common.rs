@@ -45,13 +45,27 @@ pub fn require_service_key(key: &str, allow_anonymous: &str) -> ResultType<()> {
 
 pub fn init_service_log(name: &str) -> ResultType<flexi_logger::LoggerHandle> {
     use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming, WriteMode};
-    Ok(Logger::try_with_env_or_str("info")?
-        .log_to_file(FileSpec::default().directory(get_arg_or("LOG_DIR", "logs".into())).basename(name))
-        .duplicate_to_stdout(Duplicate::Info)
+    let dir = get_arg_or("LOG_DIR", "logs".into());
+    let file_logger = Logger::try_with_env_or_str("info")?
+        .log_to_file(FileSpec::default().directory(&dir).basename(name))
+        .duplicate_to_stdout(Duplicate::All)
         .format(flexi_logger::opt_format)
         .rotate(Criterion::AgeOrSize(Age::Day, 10 * 1024 * 1024), Naming::Timestamps, Cleanup::KeepLogFiles(31))
         .write_mode(WriteMode::Async)
-        .start()?)
+        .start();
+    match file_logger {
+        Ok(handle) => Ok(handle),
+        // An unwritable LOG_DIR must not stop the service; keep the previous stdout-only logging.
+        Err(err) => {
+            let handle = Logger::try_with_env_or_str("info")?
+                .log_to_stdout()
+                .format(flexi_logger::opt_format)
+                .write_mode(WriteMode::Async)
+                .start()?;
+            log::warn!("File logging to {dir} disabled, using stdout only: {err}");
+            Ok(handle)
+        }
+    }
 }
 
 pub async fn listen_tcp(

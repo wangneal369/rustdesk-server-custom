@@ -39,8 +39,8 @@ Both servers ignore `X-Real-IP` and `X-Forwarded-For` by default and use the
 socket's source address. To trust a reverse proxy, set `TRUSTED_PROXIES` to a
 comma-separated list of its IP addresses or CIDR networks, for example
 `TRUSTED_PROXIES=127.0.0.1/32,::1/128`. The setting is read through the same
-configuration sources as other server options. Invalid entries cause WebSocket
-handshakes to fail rather than enabling trust.
+configuration sources as other server options. Invalid entries make startup fail
+rather than enabling trust.
 
 Only a connection from a listed proxy may supply a forwarded address. The proxy
 must overwrite `X-Real-IP` (preferred) or maintain `X-Forwarded-For` correctly;
@@ -152,8 +152,9 @@ directory.
 Both binaries reuse `flexi_logger`. `RUST_LOG` defaults to `info`; `LOG_DIR`
 defaults to `logs` relative to the working directory. Logging starts after
 configuration loading. Files use separate `hbbs` / `hbbr` basenames, rotate daily
-or at 10 MiB, and retain 31 historical files (not a guaranteed 31 days). Info and
-higher levels are also duplicated to stdout. Restrict the directory ACL and
+or at 10 MiB, and retain 31 historical files (not a guaranteed 31 days). Every record that
+passes `RUST_LOG` is also duplicated to stdout. If `LOG_DIR` cannot be created or
+written, the service logs a warning and continues with stdout only. Restrict the directory ACL and
 configure monitoring / external collection for your deployment.
 
 ```bash
