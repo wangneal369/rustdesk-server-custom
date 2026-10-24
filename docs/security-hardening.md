@@ -1,0 +1,105 @@
+# 安全修复进度（2026-10-24）
+
+本记录不是“漏洞全部修复”或可直接上线的结论。范围包含 `hbbs`、`hbbr` 及同级客户端仓库；本轮原生验证平台为 Windows x86_64 MSVC。
+
+## 已落地的服务端修复
+
+- 服务端 WebSocket 入口与共享库统一使用 `tokio-tungstenite/tungstenite 0.26.2`，移除含 RUSTSEC-2023-0065 的旧 0.17 依赖。通过库的重导出使用协议类型，不再维护第二份直接依赖。
+- 两个入口复用 `src/websocket.rs`：默认使用 TCP 来源地址，不再无条件信任客户端传入的 `X-Real-IP` / `X-Forwarded-For`。
+- 仅对 `TRUSTED_PROXIES` 明确列出的代理接受转发地址。完整处理重复的 `X-Forwarded-For` 头，并从右向左找到首个非可信跳点。代理必须覆盖 `X-Real-IP`，或正确维护转发链。
+- WebSocket 握手限定为 10 秒；无效可信代理配置返回错误，不降级为信任全部来源。
+- 保持原有二进制消息、打洞、转发、连接清理与密钥匹配链路；本轮未修改协议字段或连接凭据格式。
+
+兼容更新由 Cargo 完成；以下版本是当前锁定值，而不是对未来最新版的承诺：
+
+| 依赖 | 修改前 | 修改后 |
+| --- | --- | --- |
+| crossbeam-epoch | 0.9.8 | 0.9.21 |
+| openssl / openssl-sys | 0.10.68 / 0.9.104 | 0.10.81 / 0.9.117 |
+| rustls（0.23 分支） | 0.23.42 | 0.23.46 |
+| rustls-webpki（0.103 分支） | 0.103.13 | 0.103.16 |
+| tempfile | 3.3.0 | 3.27.0 |
+| webpki | 0.22.0 | 0.22.4 |
+| webpki-roots（0.26 / 1.x 分支） | 0.26.7 / 1.0.9 | 0.26.11 / 1.0.11 |
+| webpki-root-certs | 1.0.9 | 1.0.11 |
+
+`remove_dir_all 0.5.3` 已从服务端锁文件移除。Git 依赖修订号及两个共享子模块的原始固定提交未变。
+
+## 验证证据
+
+服务端仓库执行下列命令成功（额外的 `--config` 仅指定本机临时下载源）：
+
+```powershell
+cargo test --locked --all-targets -- --skip database::tests::test_insert
+```
+
+结果：库测试 14、hbbr 测试 12、集成测试 1，合计 27 项通过；其余两个二进制测试目标为 0 项，不能计为额外测试覆盖。
+
+数据库原有 10,000 次插入压测在前一轮构建的测试程序中单独通过，耗时约 629 秒；为避免重复写同一测试数据库，上述全目标命令排除该项。**最终补丁依赖组合未重跑这项数据库压测。** SQLx、SQLite 版本及数据库实现本轮未变。
+
+| 需求 / 行为 | 证据（`websocket::tests` 内的测试） |
+| --- | --- |
+| 非可信来源不能伪造地址 | `untrusted_peers_cannot_spoof_forwarded_addresses` |
+| 可信代理支持 IPv4 / IPv6 / IPv4 映射地址 | `trusted_proxy_addresses_support_ipv4_and_ipv6` |
+| 单行及重复转发头不能越过首个非可信跳点 | `forwarded_chain_stops_at_the_first_untrusted_hop` |
+| 缺失或错误地址不替换 TCP 来源地址 | `missing_or_malformed_forwarded_addresses_keep_the_socket_address` |
+| 错误代理配置不放开信任 | `invalid_trusted_proxy_configuration_is_rejected` |
+| 合法握手及二进制消息往返正常 | `websocket_handshake_preserves_binary_messages` |
+| 未完成握手会超时释放连接 | `stalled_websocket_handshakes_time_out` |
+
+重复转发头的新增回归用例在修复解析前失败，修复后通过。独立测试载体只作早期定位，不替代上述实际工程验证。
+
+## 依赖审计与尚未解决的项
+
+使用官方 `rustsec` 库 0.33.0 对锁文件生成报告；数据库快照为 RustSec/advisory-db 提交 `84d943a6deeb8cc6c6f632531aaf4f1c62275239`。按“依赖版本 × 公告”计数，包含其他平台及开发/构建依赖，不等于已证实可远程利用的漏洞数量。
+
+服务端本轮兼容更新前为 31 条命中，更新后为 18 条（前一轮已移除的旧 tungstenite 不包含在这个 31 的基线中）：
+
+| 剩余依赖 / 公告 | 当前判断与后续边界 |
+| --- | --- |
+| axum-core 0.2.4 / RUSTSEC-2022-0055 | OSS 源码未发现 axum 路由使用；依赖仍在锁文件，不能宣称已消除。后续可单独确认并删除未使用依赖。 |
+| h2 0.3.26 / RUSTSEC-2026-0258 | 来自 Hyper / Reqwest 0.11 链；升级须保留项目 Reqwest fork 的代理及平台 TLS 行为。 |
+| libsqlite3-sys 0.24.2 / RUSTSEC-2022-0090 | 公告涉及 SQLite printf 大字符串溢出；已查看固定参数化 SQL，未发现该函数入口，但旧引擎本身尚未替换。 |
+| sqlx 0.6.0 / RUSTSEC-2024-0363 | 公告重点是数据库二进制协议长度溢出；该服务端实际使用 SQLite。迁移前须处理查询宏缓存及数据库回归，未盲目跨大版本升级。 |
+| rustls 0.20 / 0.21、rustls-webpki 0.101、旧 webpki-roots、ring 0.16 | 来自旧 SQLx / Reqwest / JWT 依赖链；已修复 0.23 分支不代表这些并存版本已修复。 |
+| quick-xml 0.39.4 / RUSTSEC-2026-0194、0195 | 来自 wayland-scanner 构建链；不能当成 Windows 服务端远程 XML 接口漏洞，也未忽略其依赖风险。 |
+| users 0.11 / RUSTSEC-2025-0040 | Linux 专属依赖，公告涉及组列表用于访问控制；无同系列补丁，须先核实实际组查询调用再替换。 |
+
+## 已落地的客户端补丁与边界
+
+客户端仅修改 `Cargo.lock`，未改动远控、登录、文件传输或 Flutter 桥接代码：
+
+| 依赖 | 修改前 | 最终锁定值 |
+| --- | --- | --- |
+| crossbeam-channel | 0.5.13 | 0.5.17 |
+| openssl / openssl-sys | 0.10.68 / 0.9.104 | 0.10.72 / 0.9.107 |
+| rustls | 0.23.28 | 0.23.46 |
+| quinn-proto | 0.11.15 | 0.11.19 |
+
+这些版本移除对应的 RustSec 命中，其他必要的传递依赖由 Cargo 同步调整；Git 修订号未变。客户端基础库在 Windows MSVC 上完成：
+
+```powershell
+cargo check --locked -p base
+cargo test --locked -p base --lib
+cargo test --locked -p base --lib -- --ignored
+```
+
+普通用例 16 项通过，默认忽略的 3 项 Windows 符号链接权限用例已显式执行并全部通过，共 19 项。覆盖原有的路径逃逸、UNC 路径、NTFS 流、覆盖确认、断点恢复、符号链接与配置键检查。**这不等于完整桌面客户端已编译或远控联调通过。** 构建仍提示既有弃用与 LNK4098 CRT 链接警告，本轮未修改全局链接选项来掩盖警告。
+
+客户端最终审计从 24 条降到 12 条；剩余为 `idna 0.5.0`、`libgit2-sys 0.14.2`、三个旧 `quick-xml` 分支、`ringbuf 0.3.3`、`time 0.1.45 / 0.3.36`、`users 0.11.0`，仍需检查父依赖、平台和实际使用的 API。
+
+### Rust 构建基线不能隐式改变
+
+客户端清单及多数 CI 仍声明 Rust 1.75。审查注册表元数据发现，修复公告所要求的 `time >=0.3.47` 最低需要 Rust 1.88；本轮暂保留原版本并记录 RUSTSEC-2026-0009，未通过修改 CI 或隐藏告警来声称修复。
+
+OpenSSL 特意选择已修复相关公告、且保留 Rust 1.63 最低要求的 0.10.72 / openssl-sys 0.9.107，而非会把该依赖最低要求提升到 1.80 的最新版。`quinn-proto 0.11.19` 与原 0.11.15 均要求 Rust 1.85；这个原有的锁文件/CI 不一致问题也必须后续核对。因此，本轮未声称验证了 Rust 1.75 兼容性。
+
+可选 Tauri UI 的独立锁文件本轮未修改，其初始审计有 9 条命中；不能把服务端或基础库测试作为 UI 的验证结论。
+
+## 认证与部署边界
+
+- 本轮**没有**把开放式中继策略改成账户体系；hbbr 未设置 KEY 时的开放配对行为仍存在。
+- 公钥匹配不是用户身份认证。不能仅因客户端填了服务器公钥，就称服务器只允许企业成员接入。
+- 远程桌面访问另有密码/人工确认等逻辑；允许使用中继不等于允许绕过被控端的访问授权。
+- 只有原生客户端时，不必公开 WebSocket 端口；使用反向代理时，按 `environment-variables.md` 配置可信代理，不能信任整个客户端网段。
+- 未做公网部署、Linux/macOS 原生构建、完整远控联调、发布签名或品牌/Logo 替换。后续品牌改造应复用客户端现有 app-name 与 Logo 资产入口，不批量改写协议、持久化标识或第三方许可证署名。

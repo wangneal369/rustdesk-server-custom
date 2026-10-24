@@ -32,6 +32,7 @@ use hbb_common::{
 };
 use ipnetwork::Ipv4Network;
 use sodiumoxide::crypto::sign;
+use tokio_tungstenite::tungstenite;
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -867,7 +868,7 @@ impl RendezvousServer {
                         allow_err!(s.send(Bytes::from(bytes)).await);
                     }
                     Sink::Ws(ws) => {
-                        allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
+                        allow_err!(ws.send(tungstenite::Message::Binary(bytes.into())).await);
                     }
                 }
             }
@@ -1190,32 +1191,8 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         let mut sink;
         if ws {
-            use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-            let callback = |req: &Request, response: Response| {
-                let headers = req.headers();
-                // X-Real-IP / X-Forwarded-For are trusted as-is so that the real
-                // client IP is preserved when the WebSocket port runs behind a
-                // reverse proxy (WSS). They are NOT validated: anyone who can reach
-                // this port directly can spoof an arbitrary IP, bypassing IP-based
-                // rate limiting / blocking and corrupting logged IPs. Do not expose
-                // the WebSocket port directly to untrusted networks; only the
-                // reverse proxy, which overwrites these headers, should be able to
-                // connect to it.
-                // https://github.com/rustdesk/rustdesk-server/issues/634
-                let real_ip = headers
-                    .get("X-Real-IP")
-                    .or_else(|| headers.get("X-Forwarded-For"))
-                    .and_then(|header_value| header_value.to_str().ok());
-                if let Some(ip) = real_ip {
-                    if ip.contains('.') {
-                        addr = format!("{ip}:0").parse().unwrap_or(addr);
-                    } else {
-                        addr = format!("[{ip}]:0").parse().unwrap_or(addr);
-                    }
-                }
-                Ok(response)
-            };
-            let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+            let (ws_stream, peer_addr) = crate::websocket::accept(stream, addr).await?;
+            addr = peer_addr;
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink::Ws(a));
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {

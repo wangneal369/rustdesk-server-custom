@@ -34,6 +34,23 @@ in the inherited process environment.
 
 ---
 
+## WebSocket reverse proxies
+
+Both servers ignore `X-Real-IP` and `X-Forwarded-For` by default and use the
+socket's source address. To trust a reverse proxy, set `TRUSTED_PROXIES` to a
+comma-separated list of its IP addresses or CIDR networks, for example
+`TRUSTED_PROXIES=127.0.0.1/32,::1/128`. The setting is read through the same
+configuration sources as other server options. Invalid entries cause WebSocket
+handshakes to fail rather than enabling trust.
+
+Only a connection from a listed proxy may supply a forwarded address. The proxy
+must overwrite `X-Real-IP` (preferred) or maintain `X-Forwarded-For` correctly;
+forwarded chains are read from right to left until the first untrusted hop.
+Do not trust entire client networks. WebSocket handshakes must complete within
+10 seconds. Ports 21118/21119 need not be published when no web client is used.
+
+---
+
 ## `hbbs` — ID / rendezvous server
 
 | Variable | CLI flag | Default | Description |
