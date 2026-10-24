@@ -28,9 +28,8 @@ three ways to set the same thing.
 For **`hbbr`** the precedence is: **flag** (`-b`, `-p`, `-k`) → **`.env`** →
 **inherited environment**.
 
-`RUST_LOG` is an exception to these rules. Both binaries initialize logging
-before loading `.env` (or `hbbs`'s `--config` file), so `RUST_LOG` must be set
-in the inherited process environment.
+Both binaries initialize logging after loading configuration, so `RUST_LOG`
+and `LOG_DIR` can also be supplied in `.env` / the hbbs configuration file.
 
 ---
 
@@ -47,7 +46,7 @@ Only a connection from a listed proxy may supply a forwarded address. The proxy
 must overwrite `X-Real-IP` (preferred) or maintain `X-Forwarded-For` correctly;
 forwarded chains are read from right to left until the first untrusted hop.
 Do not trust entire client networks. WebSocket handshakes must complete within
-10 seconds. Ports 21118/21119 need not be published when no web client is used.
+10 seconds. WebSocket and native TCP admission/control messages are limited to 128 KiB; hbbr restores normal TCP/WebSocket relay payload sizes after admission. The transport reuses the client's pinned buffer-growth/dynamic-limit fixes. This does not bound total concurrent connections. Ports 21118/21119 need not be published when no web client is used.
 
 ---
 
@@ -55,7 +54,7 @@ Do not trust entire client networks. WebSocket handshakes must complete within
 
 | Variable | CLI flag | Default | Description |
 |---|---|---|---|
-| `KEY` | `-k`, `--key` | `-` | Public key clients must use, a base64 secret key, or `-` / `_` to load or generate a key pair (`id_ed25519`, `id_ed25519.pub`). `-` and `_` have the same behavior, so explicitly passing `-k _` to `hbbs` is unnecessary. An explicitly empty value disables key validation; see [Keys](#keys-and-encryption). |
+| `KEY` | `-k`, `--key` | `-` | Public key clients must use, a base64 secret key, or `-` / `_` to load or generate a key pair (`id_ed25519`, `id_ed25519.pub`). `-` and `_` have the same behavior, so explicitly passing `-k _` to `hbbs` is unnecessary. An empty value is refused unless `ALLOW_ANONYMOUS=Y`; see [Keys](#keys-and-encryption). |
 | `BIND` | `-b`, `--bind` | all interfaces | **Available since 1.1.17.** Local IPv4 or IPv6 address on which all `hbbs` TCP, UDP, and WebSocket listeners bind. This does not change the addresses advertised to clients. Supported by `--config`, `.env`, and the inherited environment. |
 | `PORT` | `-p`, `--port` | `21116` | Main TCP/UDP listening port. `hbbs` also binds `PORT-1` (NAT type test) and `PORT+2` (WebSocket). |
 | `RELAY-SERVERS` | `-r`, `--relay-servers` | *(empty)* | Optional relay server override handed to clients, as comma-separated `host` or `host:port` values. Leave empty when `hbbr` uses the same address as `hbbs` and the standard port `21117`; clients derive it automatically. Set this only when the relay uses a different IP/hostname or a non-standard port. |
@@ -78,7 +77,7 @@ Do not trust entire client networks. WebSocket handshakes must complete within
 
 | Variable | CLI flag | Default | Description |
 |---|---|---|---|
-| `KEY` | `-k`, `--key` | *(empty)* | The empty default intentionally disables relay key validation, avoiding key-pair setup and mismatch failures. To enable relay key validation, use the same non-empty key as `hbbs`; `-` / `_` have the same behavior and load or generate a key pair. An empty key allows clients without a matching key to use the relay, so choose this tradeoff deliberately on an exposed server. |
+| `KEY` | `-k`, `--key` | *(empty)* | No default key material: startup requires the same non-empty key as `hbbs`; `-` / `_` load or generate a pair in the working directory. An empty key is refused unless `ALLOW_ANONYMOUS=Y` is explicit. |
 | `BIND` | `-b`, `--bind` | all interfaces | **Available since 1.1.17.** Local IPv4 or IPv6 address on which the relay TCP and WebSocket listeners bind. Supported by `.env` and the inherited environment; `hbbr` does not support `--config`. |
 | `PORT` | `-p`, `--port` | `21117` | Relay listening port. `hbbr` also binds `PORT+2` for WebSocket relay. **Note:** when set via the `PORT` env var (not `-p`), `hbbr` listens on `PORT + 1`, so a shared `PORT=21116` makes `hbbs`=21116 and `hbbr`=21117. |
 
@@ -150,13 +149,15 @@ directory.
 
 ## Logging
 
-Both binaries use `flexi_logger`, which honours the standard **`RUST_LOG`**
-environment variable (default level `info`). Set it in the process environment
-before launching the binary. A value in `.env` or `hbbs`'s `--config` file is
-loaded too late and has no effect on logging.
+Both binaries reuse `flexi_logger`. `RUST_LOG` defaults to `info`; `LOG_DIR`
+defaults to `logs` relative to the working directory. Logging starts after
+configuration loading. Files use separate `hbbs` / `hbbr` basenames, rotate daily
+or at 10 MiB, and retain 31 historical files (not a guaranteed 31 days). Info and
+higher levels are also duplicated to stdout. Restrict the directory ACL and
+configure monitoring / external collection for your deployment.
 
 ```bash
-RUST_LOG=debug hbbs
+RUST_LOG=info LOG_DIR=/var/log/remote-access hbbs
 ```
 
 ---
@@ -171,24 +172,65 @@ The `KEY` / `-k` value can be:
 * **`-` or `_`** — the server loads a key pair from the working directory or
   generates one on first start, writing `id_ed25519` (private) and
   `id_ed25519.pub` (public);
-* **empty** — key validation is disabled. `hbbs` still loads or generates key
-  files for signing but deliberately leaves its active validation key empty;
-  `hbbr` neither loads nor generates a key. Both services then accept clients
-  without validating a key. This is the intentional `hbbr` default; use a
-  non-empty value when relay key validation is required.
+* **empty** - refused by default. `ALLOW_ANONYMOUS=Y` explicitly opts into the
+  legacy open mode without key validation. `ALLOW_ANONYMOUS=N` (or unset) is the
+  default; other values are rejected. `Y` does not turn off a configured key.
 
-`hbbs` defaults to `-`, so it already loads or generates a key pair without an
-explicit `-k _`. `hbbr` intentionally defaults to an empty key to avoid
-key-pair setup and mismatch failures. Leave it empty for the default mode
-without key validation. To enable relay key validation, give it the same
-non-empty key as `hbbs`; both services can reuse key material from a shared
-working directory. The `_` value is not a stricter mode than `-` in the current
-implementation.
+`hbbs` defaults to `-` and loads or generates a key pair. `hbbr` has no default
+key material: configure the same non-empty KEY as hbbs, or use `hbbr -k _` in
+a working directory containing the same key files. A deployment relying on the
+old empty relay KEY must be updated before restarting this version. The `_`
+value is not stricter than `-`.
+
+**A public key is not a secret personnel credential.** Key matching does not
+implement account authentication, RBAC or offboarding. Host-side password,
+manual approval, optional 2FA and session permission checks remain necessary.
 
 To supply your own key pair, place `id_ed25519` and `id_ed25519.pub` in the
 process's **current working directory** before first start. That directory may
 differ from the directory containing the executable. For the supervisor Docker
 image, the working directory is `/data`.
+
+---
+
+## Durable audit receiver
+
+| Variable | Default | Description |
+|---|---|---|
+| `AUDIT_LISTEN` | disabled | hbbs-only explicit socket address, recommended `127.0.0.1:21114`; serve through an HTTPS reverse proxy. |
+| `AUDIT_TOKEN` | unset | Required when the listener is enabled: at least 32 non-whitespace ASCII bytes, generated randomly by the operator. Shared write credential, not an admin/read or personnel credential. |
+| `ALLOW_ANONYMOUS` | `N` | Permit an empty service KEY only when explicitly set to `Y`. Applies to both binaries. |
+| `LOG_DIR` | `logs` | Service log directory; see Logging. |
+
+The writer exposes POST `/api/audit/conn`, `/api/audit/file`, and
+`/api/audit/alarm`, with `Authorization: Bearer <AUDIT_TOKEN>`. JSON bodies are
+limited to 1 MiB and must include a nonempty `id` (at most 253 bytes) and UUID
+`nonce`. Empty 200 means committed or an identical replay; 409 means a reused
+nonce with conflicting content; storage failures return 503. `(device_id,nonce)`
+is unique in the existing SQLite `audit_event` table. No read/admin endpoint is
+added. Back up the DB, restrict file permissions and define retention externally.
+
+Client setup reuses its existing options: set `api-server` to the actual HTTPS
+API base URL and `audit-token` to the same credential, via existing managed
+configuration mechanisms. There is no new settings UI in this patch. Configure
+the proxy to preserve the audit path. A remote plaintext HTTP API is rejected;
+HTTP is permitted only for literal loopback IPs. Audit requests never follow
+redirects or disable certificate verification. If using an existing management
+API instead of this receiver, verify its nonce / response / authentication and
+file-batch compatibility before rollout.
+
+Unconfirmed client records are stored beside its main config at the path
+obtained by replacing the config extension with `.audit-outbox`. Records survive
+restart, retain their nonce, and are removed only after an empty successful
+response. Old URL / malformed records are retained for operator review. Bearer
+tokens are not copied into these records; the token itself uses existing local
+configuration storage, so protect that configuration's ACL. Unsent evidence is
+not automatically evicted: monitor free disk space and archive appropriately.
+
+Never publish the plaintext listener directly to the Internet. If binding a
+non-loopback address for a container gateway, restrict ingress to that gateway.
+See `security-hardening.md` for remaining identity, crash-window and deployment
+limitations.
 
 ---
 
@@ -201,7 +243,7 @@ by `hbbs`/`hbbr` directly:
 | Variable | Default | Description |
 |---|---|---|
 | `RELAY` | `relay.example.com` | Passed to `hbbs` as `-r $RELAY` (your public address). |
-| `ENCRYPTED_ONLY` | `0` | `1` adds `-k _` to both servers. This is redundant for `hbbs`, whose default is `-`, and opts `hbbr` into key validation instead of its intentional empty default. |
+| `ENCRYPTED_ONLY` | `1` | `1` adds `-k _` to both servers. Set this (or a shared non-empty `KEY`) for the hardened relay; the old empty default now fails startup. |
 | `KEY_PUB` | *(unset)* | If set, written to `/data/id_ed25519.pub` on first start. |
 | `KEY_PRIV` | *(unset)* | If set, written to `/data/id_ed25519` on first start. Provide **both** `KEY_PUB` and `KEY_PRIV`, or neither. |
 
@@ -221,7 +263,7 @@ binaries and does **not** implement `RELAY`, `ENCRYPTED_ONLY`, `KEY_PUB`, or
 ```bash
 # Tell clients where the relay listens because it is not using port 21117.
 hbbs -p 22116 -r rustdesk.example.com:22117
-hbbr -p 22117
+hbbr -p 22117 -k _
 ```
 
 ### `.env` file (working directory)
@@ -229,6 +271,7 @@ hbbr -p 22117
 ```ini
 # Non-standard ports shared by both binaries; hbbr listens on PORT+1.
 relay-servers=rustdesk.example.com:22117
+KEY=_
 PORT=22116
 ```
 
@@ -240,6 +283,7 @@ services:
     image: rustdesk/rustdesk-server-s6:latest
     environment:
       - RELAY=rustdesk.example.com:21117
+      - ENCRYPTED_ONLY=1
       - ALWAYS_USE_RELAY=Y
       - RUST_LOG=info
       - SINGLE_BANDWIDTH=256

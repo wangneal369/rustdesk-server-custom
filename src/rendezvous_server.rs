@@ -131,6 +131,7 @@ impl RendezvousServer {
         key: &str,
         rmem: usize,
     ) -> ResultType<()> {
+        require_service_key(key, &get_arg("ALLOW_ANONYMOUS"))?;
         let (key, sk) = Self::get_server_sk(key)?;
         let nat_port = port - 1;
         let ws_port = port + 2;
@@ -219,6 +220,7 @@ impl RendezvousServer {
                 }
             });
         };
+        let audit_task = crate::audit::run(rs.pm.db.clone());
         let main_task = async move {
             loop {
                 log::info!("Start");
@@ -261,6 +263,7 @@ impl RendezvousServer {
         tokio::select!(
             res = main_task => res,
             res = listen_signal => res,
+            res = audit_task => res,
         )
     }
 
@@ -1148,7 +1151,8 @@ impl RendezvousServer {
             });
             return;
         }
-        let stream = FramedStream::from(stream, addr);
+        let mut stream = FramedStream::from(stream, addr);
+        *stream.codec_mut() = control_codec();
         tokio::spawn(async move {
             let mut stream = stream;
             if let Some(Ok(bytes)) = stream.next_timeout(30_000).await {
@@ -1203,7 +1207,7 @@ impl RendezvousServer {
                 }
             }
         } else {
-            let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
+            let (a, mut b) = Framed::new(stream, control_codec()).split();
             sink = Some(Sink::TcpStream(a));
             while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
@@ -1266,7 +1270,7 @@ impl RendezvousServer {
         }
 
         if !key.is_empty() {
-            log::info!("Key: {}", key);
+            log::info!("Access key configured (value redacted)");
         }
         Ok((key, out_sk))
     }

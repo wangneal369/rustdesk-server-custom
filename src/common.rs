@@ -25,6 +25,35 @@ pub fn parse_bind_address(value: &str) -> Result<Option<IpAddr>> {
     }
 }
 
+// Rendezvous and relay admission carry control messages, not desktop/media payloads.
+pub const MAX_CONTROL_MESSAGE: usize = 128 * 1024;
+
+pub fn control_codec() -> hbb_common::bytes_codec::BytesCodec {
+    let mut codec = hbb_common::bytes_codec::BytesCodec::new();
+    codec.set_max_packet_length(MAX_CONTROL_MESSAGE);
+    codec
+}
+
+pub fn require_service_key(key: &str, allow_anonymous: &str) -> ResultType<()> {
+    match allow_anonymous {
+        "Y" => Ok(()),
+        "" | "N" if !key.trim().is_empty() => Ok(()),
+        "" | "N" => hbb_common::bail!("KEY is required; set ALLOW_ANONYMOUS=Y only to explicitly allow open service"),
+        _ => hbb_common::bail!("ALLOW_ANONYMOUS must be Y or N"),
+    }
+}
+
+pub fn init_service_log(name: &str) -> ResultType<flexi_logger::LoggerHandle> {
+    use flexi_logger::{Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming, WriteMode};
+    Ok(Logger::try_with_env_or_str("info")?
+        .log_to_file(FileSpec::default().directory(get_arg_or("LOG_DIR", "logs".into())).basename(name))
+        .duplicate_to_stdout(Duplicate::Info)
+        .format(flexi_logger::opt_format)
+        .rotate(Criterion::AgeOrSize(Age::Day, 10 * 1024 * 1024), Naming::Timestamps, Cleanup::KeepLogFiles(31))
+        .write_mode(WriteMode::Async)
+        .start()?)
+}
+
 pub async fn listen_tcp(
     bind_addr: Option<IpAddr>,
     port: u16,
@@ -456,6 +485,30 @@ async fn check_software_update_() -> hbb_common::ResultType<()> {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn control_messages_reject_oversized_headers_before_reading_payloads() {
+        use hbb_common::{bytes::{Bytes, BytesMut}, tokio_util::codec::{Decoder, Encoder}};
+        let mut bytes = BytesMut::new();
+        let mut codec = control_codec();
+        codec.encode(Bytes::from(vec![7; MAX_CONTROL_MESSAGE]), &mut bytes).unwrap();
+        assert_eq!(codec.decode(&mut bytes).unwrap().unwrap().len(), MAX_CONTROL_MESSAGE);
+        // Only the four-byte length header is sent: no large payload is needed to reject it.
+        let header = (((MAX_CONTROL_MESSAGE + 1) as u32) << 2 | 3).to_le_bytes();
+        assert!(control_codec().decode(&mut BytesMut::from(header.as_slice())).is_err());
+    }
+
+    #[test]
+    fn service_admission_requires_key_or_explicit_anonymous_mode() {
+        for key in ["", " ", "\t"] {
+            assert!(require_service_key(key, "").is_err());
+            assert!(require_service_key(key, "N").is_err());
+            assert!(require_service_key(key, "Y").is_ok());
+        }
+        assert!(require_service_key("configured-key", "").is_ok());
+        assert!(require_service_key("-", "N").is_ok());
+        assert!(require_service_key("configured-key", "yes").is_err());
+    }
 
     #[test]
     fn argument_names_ignore_case_and_separator() {

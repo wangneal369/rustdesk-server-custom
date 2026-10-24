@@ -2,17 +2,11 @@ use clap::App;
 mod common;
 mod websocket;
 mod relay_server;
-use flexi_logger::*;
 use hbb_common::{config::RELAY_PORT, ResultType};
 use relay_server::*;
 mod version;
 
 fn main() -> ResultType<()> {
-    let _logger = Logger::try_with_env_or_str("info")?
-        .log_to_stdout()
-        .format(opt_format)
-        .write_mode(WriteMode::Async)
-        .start()?;
     let args = format!(
         "-b, --bind=[IP] 'Sets the IP address to bind to (default: all interfaces)'
         -p, --port=[NUMBER(default={RELAY_PORT})] 'Sets the listening port'
@@ -30,6 +24,7 @@ fn main() -> ResultType<()> {
             section.iter().for_each(|(k, v)| common::set_arg(k, v));
         }
     }
+    let _logger = common::init_service_log("hbbr")?;
     let mut port = RELAY_PORT;
     if let Some(v) = common::get_arg_opt("PORT") {
         let v: i32 = v.parse().unwrap_or_default();

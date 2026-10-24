@@ -1,126 +1,96 @@
-# 安全修复进度（2026-10-24）
+# 安全修复与剩余边界（2026-10-24）
 
-本记录不是“漏洞全部修复”或可直接上线的结论。范围包含 `hbbs`、`hbbr` 及同级客户端仓库；本轮原生验证平台为 Windows x86_64 MSVC。
+本记录不是“全部漏洞修复”或“可直接上线”的结论。范围为 hbbs、hbbr 和配套客户端；实际验证平台为 Windows x86_64 MSVC。未更改原生打洞、加密协议字段或共享子模块固定提交。
 
-## 已落地的服务端修复
+## 本轮已实现
 
-- 服务端 WebSocket 入口与共享库统一使用 `tokio-tungstenite/tungstenite 0.26.2`，移除含 RUSTSEC-2023-0065 的旧 0.17 依赖。通过库的重导出使用协议类型，不再维护第二份直接依赖。
-- 两个入口复用 `src/websocket.rs`：默认使用 TCP 来源地址，不再无条件信任客户端传入的 `X-Real-IP` / `X-Forwarded-For`。
-- 仅对 `TRUSTED_PROXIES` 明确列出的代理接受转发地址。完整处理重复的 `X-Forwarded-For` 头，并从右向左找到首个非可信跳点。代理必须覆盖 `X-Real-IP`，或正确维护转发链。
-- WebSocket 握手限定为 10 秒；无效可信代理配置返回错误，不降级为信任全部来源。
-- 保持原有二进制消息、打洞、转发、连接清理与密钥匹配链路；本轮未修改协议字段或连接凭据格式。
+### 认证与传输
 
-兼容更新由 Cargo 完成；以下版本是当前锁定值，而不是对未来最新版的承诺：
+- hbbs / hbbr 默认拒绝空白 KEY。只有显式设置 `ALLOW_ANONYMOUS=Y` 才允许空 KEY；迁移时必须给 hbbr 配置与 hbbs 相同的非空 KEY（或共享密钥文件并使用 `-k _`）。不再把旧的空 KEY 默认行为静默保留下来。随附 Compose、systemd hbbr 启动参数及 s6 镜像默认值已同步使用共享密钥；没有在本机执行 Docker / Linux 服务部署。
+- 原生 UDP 注册/探测并非所有消息都携带 KEY 凭据；空 KEY 启动拒绝不等于这些入口已经实现全量身份认证，也不等于注册设备自动获得远控权限。若要求封闭设备准入，需要独立的登记/身份方案和协议联调，不能仅增加一个启动参数后声称完成。
+- **KEY / 公钥匹配不是人员身份认证**，公钥也不应作为秘密口令。远程会话继续使用客户端原有的密码、人工确认、可选 2FA、白名单和权限校验；本轮没有声称实现企业账号、RBAC、人员离职撤权或客户端设备证书认证。
+- WebSocket 服务入口复用客户端已经采用的 tokio-tungstenite / tungstenite 0.29 修补分支，分别固定为 `c241b11b03de4881faf1ecd2fe6e867c92f3013b` / `efce47e5364f00a63302cf07ab1fb13ded478914`；握手超时 10 秒。共享库内部仍有 0.26.2 依赖，没有编辑共享子模块。默认不信任客户端转发地址，只对 `TRUSTED_PROXIES` 指定代理解析来源；转发链从右向左停止于首个不可信跳点。
+- 服务端 TCP 控制入口及 hbbs / hbbr WebSocket 准入消息限制为 128 KiB，超大 TCP 声明长度在读取正文前拒绝，WebSocket 同时限制单帧与完整消息，不能用分片绕过。复用客户端传输分支的动态配置能力，中继 TCP / WebSocket 完成准入后恢复媒体报文上限，保留原生/混合中继业务行为；其读取缓冲按实际收到的数据增长，不按远端声明长度一次性扩张。仍未宣称限制总并发连接数或消除全部 DoS。
+- 审计传输强制远端 HTTPS、校验证书、禁止重定向、配置代理失败不得绕过代理。仅字面量 loopback IP 允许 HTTP。未改变其他历史 HTTP 接口的兼容性回退行为；这些接口的无效证书兼容模式仍是后续风险项。
 
-| 依赖 | 修改前 | 修改后 |
-| --- | --- | --- |
-| crossbeam-epoch | 0.9.8 | 0.9.21 |
-| openssl / openssl-sys | 0.10.68 / 0.9.104 | 0.10.81 / 0.9.117 |
-| rustls（0.23 分支） | 0.23.42 | 0.23.46 |
-| rustls-webpki（0.103 分支） | 0.103.13 | 0.103.16 |
-| tempfile | 3.3.0 | 3.27.0 |
-| webpki | 0.22.0 | 0.22.4 |
-| webpki-roots（0.26 / 1.x 分支） | 0.26.7 / 1.0.9 | 0.26.11 / 1.0.11 |
-| webpki-root-certs | 1.0.9 | 1.0.11 |
+### 可持久化审计
 
-`remove_dir_all 0.5.3` 已从服务端锁文件移除。Git 依赖修订号及两个共享子模块的原始固定提交未变。
+- hbbs 可通过 `AUDIT_LISTEN` / `AUDIT_TOKEN` 启用 `/api/audit/conn`、`/api/audit/file`、`/api/audit/alarm` 写入端点。默认关闭；建议只绑定 loopback 并在 HTTPS 反向代理后使用。
+- Bearer token 至少 32 个非空白 ASCII 字节，恒定时间比较；未授权请求不写数据库；请求体限 1 MiB，要求非空设备 id 和 UUID nonce。凭据不写入服务日志。
+- 复用现有 SQLite 数据库，新增 `audit_event` 表；提交后才返回空 200。`(device_id, nonce)` 唯一：相同内容重试只确认一次，不同内容返回 409，不覆盖原记录。TCP 来源与接收 UTC 时间由服务端填写；设备身份和事件字段仍是客户端声明，不能视为不可抵赖的人员身份。
+- 客户端审计先写配置目录旁的 `.audit-outbox`，同步文件并原子改名；失败保留，重启扫描并补传，只有空 2xx 确认才删除。记录包含 nonce 与事件时间，不在 outbox 中保存 Bearer token。
+- 补传只向当前配置的审计 URL 发送；历史 URL 或损坏记录保留供检查，不向旧服务泄露新 token。`occurred_at_ms` 是客户端时间，服务端 `received_at` 是接收时间。
+- 文件日志按每批 10 项拆分并加批次信息，不再仅记录前 10 个名称。连接、文件、告警生产者沿用原有业务链路。
+
+### 运维日志与依赖
+
+- KEY 日志只输出“已配置”，不输出原值。沿用 flexi_logger，`LOG_DIR` 默认 `logs`；每日或 10 MiB 轮转，保留 31 个历史文件，同时输出 info 及以上至 stdout。31 个文件不等于保证 31 天留存。
+- 日志初始化改到配置加载之后，`.env` / 配置文件中的日志路径与等级可生效。
+- SQLx 0.6 升至 0.8.6、SQLite 绑定升至 libsqlite3-sys 0.30.1；适配连接及建表 API，保留原 peer 表和参数化 CRUD。Axum 升至 0.8；删除源码未使用的旧 JWT / bcrypt / headers / tower-http / http 直接依赖。锁定 ed25519 1.5.3，避免旧 1.5.0 错选不兼容 signature 主版本。
+- 服务端旧 Reqwest fork 仅被版本检查 POST 和测试使用；已改用 Reqwest 0.12，保留平台 native TLS / rustls-native-roots 及系统代理支持，并移除旧 Hyper/h2/rustls 0.21 依赖链，不保留未使用的 blocking/socks 能力。
+- 上一轮兼容修补的 openssl、rustls 0.23、crossbeam、tempfile 等更新继续保留。除移除上述不再需要的 Reqwest Git fork、复用上述两个客户端已有且固定提交的传输修补依赖外，其余 Git 依赖修订号和两个共享子模块固定提交未变；开发工具、密钥、数据库不提交到仓库。
+
+## 部署配置
+
+详见 `environment-variables.md` 的 Logging、Keys and encryption 和 Durable audit receiver 章节。客户端需要配置实际 HTTPS `api-server` 和同值 `audit-token`；目前复用现有配置选项机制，没有新增配置 UI。
+
+审计是显式启用项：不设置监听地址和客户端审计服务地址，不会自动生成集中审计记录。非 loopback 监听应只允许 HTTPS 网关访问，禁止明文向公网公开 token。客户端 token 沿用本地配置存储，部署方必须限制配置/日志/SQLite/outbox 的文件 ACL；Windows 权限继承也需要核验。
 
 ## 验证证据
 
-服务端仓库执行下列命令成功（额外的 `--config` 仅指定本机临时下载源）：
+测试与检查命令（`--config` 仅为本机临时下载源，不改变源码依赖）：
 
 ```powershell
+# 服务端全部目标；排除旧的固定文件名 10,000 次插入压测
 cargo test --locked --all-targets -- --skip database::tests::test_insert
+# 客户端基础模块和直接编译实际 HTTP 工厂的集成测试
+cargo test --locked -p base --all-targets -- --include-ignored
 ```
 
-结果：库测试 14、hbbr 测试 12、集成测试 1，合计 27 项通过；其余两个二进制测试目标为 0 项，不能计为额外测试覆盖。
+最终结果：服务端库 20、hbbr 17、集成 3，合计 40 次测试执行通过（部分共享测试在两个目标重复执行）；客户端基础库 24、实际 HTTP 工厂集成 2，合计 26 次通过，无忽略项。完整客户端检查的原生依赖限制见本节末尾。
 
-数据库原有 10,000 次插入压测在前一轮构建的测试程序中单独通过，耗时约 629 秒；为避免重复写同一测试数据库，上述全目标命令排除该项。**最终补丁依赖组合未重跑这项数据库压测。** SQLx、SQLite 版本及数据库实现本轮未变。
-
-| 需求 / 行为 | 证据（`websocket::tests` 内的测试） |
+| 需求 | 精确测试证据 |
 | --- | --- |
-| 非可信来源不能伪造地址 | `untrusted_peers_cannot_spoof_forwarded_addresses` |
-| 可信代理支持 IPv4 / IPv6 / IPv4 映射地址 | `trusted_proxy_addresses_support_ipv4_and_ipv6` |
-| 单行及重复转发头不能越过首个非可信跳点 | `forwarded_chain_stops_at_the_first_untrusted_hop` |
-| 缺失或错误地址不替换 TCP 来源地址 | `missing_or_malformed_forwarded_addresses_keep_the_socket_address` |
-| 错误代理配置不放开信任 | `invalid_trusted_proxy_configuration_is_rejected` |
-| 合法握手及二进制消息往返正常 | `websocket_handshake_preserves_binary_messages` |
-| 未完成握手会超时释放连接 | `stalled_websocket_handshakes_time_out` |
+| TCP 超大长度声明提前拒绝 | `common::tests::control_messages_reject_oversized_headers_before_reading_payloads` |
+| hbbs WebSocket 单帧及分片超限拒绝 | `websocket::tests::oversized_websocket_control_messages_are_rejected` |
+| 正确凭据完成 TCP / WebSocket / 两种混合配对，并转发大于准入上限的媒体数据 | `relay_server::tests::relay_media_payloads_are_not_limited_to_admission_size` |
+| 错误中继凭据在 TCP / WebSocket 均不能进入配对池 | `relay_server::tests::invalid_relay_credentials_never_enter_the_pairing_pool` |
+| 默认拒绝空 KEY，显式开放与错误配置分支 | `common::tests::service_admission_requires_key_or_explicit_anonymous_mode`、`relay_startup_rejects_an_empty_key_by_default` |
+| 启动日志落盘且不包含配置 KEY | `relay_startup_redacts_the_key_and_writes_a_log_file` |
+| 审计配置边界 | `audit::tests::audit_listener_rejects_unusable_credentials_and_addresses` |
+| 实际 HTTP 鉴权、非法字段、413、nonce 重试与冲突保护 | `audit::tests::audit_http_requires_credentials_and_persists_idempotently` |
+| 原 peer CRUD 及审计去重重启后保持 | `database::tests::peer_updates_and_audit_records_survive_database_reopen` |
+| 不可信转发地址与完整代理链 | `websocket::tests::untrusted_peers_cannot_spoof_forwarded_addresses`、`forwarded_chain_stops_at_the_first_untrusted_hop` |
+| 实际二进制往返、握手超时 | `websocket::tests::websocket_handshake_preserves_binary_messages`、`stalled_websocket_handshakes_time_out` |
+| 审计 URL 禁止远程明文及 URL 凭据 | `audit_outbox::tests::audit_transport_rejects_remote_plaintext_and_url_credentials` |
+| 重启恢复、收到确认前保留 | `audit_outbox::tests::pending_audit_survives_restart_until_acknowledged` |
+| 失败同 nonce 补传、不发送旧 URL | `audit_outbox::tests::failed_delivery_is_retried_with_same_nonce_and_old_hosts_are_not_sent` |
+| 不可写或非法事件不能假报落盘成功 | `audit_outbox::tests::invalid_or_unwritable_audit_is_not_reported_as_persisted` |
+| 文件名称完整、分批 nonce 唯一 | `audit_outbox::tests::file_audit_batches_keep_all_names_and_unique_nonces` |
+| 实际 HTTP 工厂不跟随重定向、不发送明文 | `audit_http_does_not_follow_redirects`、`remote_audit_factory_never_sends_plaintext` |
 
-重复转发头的新增回归用例在修复解析前失败，修复后通过。独立测试载体只作早期定位，不替代上述实际工程验证。
+旧 10,000 次插入压测曾在前一轮依赖组合通过，本轮 SQLx 升级后未重跑该压测；新增临时数据库 CRUD / 重启测试用于本轮兼容性验证。基础模块和 HTTP 工厂测试不能替代完整客户端、Flutter、移动端、GUI 或生产联调验证。完整客户端 `cargo check --locked --lib --no-default-features` 已实际尝试；安装并验证 libclang 后继续构建，仍因未配置 `VCPKG_ROOT` / 原生媒体库而失败，不能宣称完整客户端类型检查通过。
 
-## 依赖审计与尚未解决的项
+## RustSec 扫描结果与剩余项
 
-使用官方 `rustsec` 库 0.33.0 对锁文件生成报告；数据库快照为 RustSec/advisory-db 提交 `84d943a6deeb8cc6c6f632531aaf4f1c62275239`。按“依赖版本 × 公告”计数，包含其他平台及开发/构建依赖，不等于已证实可远程利用的漏洞数量。
+使用官方 rustsec 库 0.33.0，公告库固定为 `84d943a6deeb8cc6c6f632531aaf4f1c62275239`。计数是“依赖版本 × 公告”，包含非当前平台及开发/构建/锁文件可选依赖，不等于已证实可远程利用的漏洞数。
 
-服务端本轮兼容更新前为 31 条命中，更新后为 18 条（前一轮已移除的旧 tungstenite 不包含在这个 31 的基线中）：
+- 服务端：此前 31 → 上一轮 18 → 本轮 **4 条**。
+- 客户端：此前 24 → 上一轮 12 → 本轮 **12 条**。
+- 可选 Tauri UI 独立锁文件未在本轮修改或复核；不包含于上述服务端计数。
 
-| 剩余依赖 / 公告 | 当前判断与后续边界 |
+| 范围 | 尚存依赖与处理边界 |
 | --- | --- |
-| axum-core 0.2.4 / RUSTSEC-2022-0055 | OSS 源码未发现 axum 路由使用；依赖仍在锁文件，不能宣称已消除。后续可单独确认并删除未使用依赖。 |
-| h2 0.3.26 / RUSTSEC-2026-0258 | 来自 Hyper / Reqwest 0.11 链；升级须保留项目 Reqwest fork 的代理及平台 TLS 行为。 |
-| libsqlite3-sys 0.24.2 / RUSTSEC-2022-0090 | 公告涉及 SQLite printf 大字符串溢出；已查看固定参数化 SQL，未发现该函数入口，但旧引擎本身尚未替换。 |
-| sqlx 0.6.0 / RUSTSEC-2024-0363 | 公告重点是数据库二进制协议长度溢出；该服务端实际使用 SQLite。迁移前须处理查询宏缓存及数据库回归，未盲目跨大版本升级。 |
-| rustls 0.20 / 0.21、rustls-webpki 0.101、旧 webpki-roots、ring 0.16 | 来自旧 SQLx / Reqwest / JWT 依赖链；已修复 0.23 分支不代表这些并存版本已修复。 |
-| quick-xml 0.39.4 / RUSTSEC-2026-0194、0195 | 来自 wayland-scanner 构建链；不能当成 Windows 服务端远程 XML 接口漏洞，也未忽略其依赖风险。 |
-| users 0.11 / RUSTSEC-2025-0040 | Linux 专属依赖，公告涉及组列表用于访问控制；无同系列补丁，须先核实实际组查询调用再替换。 |
+| 服务端旧网络链（本轮已移除） | h2 0.3.26、rustls 0.21.12、rustls-webpki 0.101.7、webpki-roots 0.25.4、ring 0.16.20 已随 Reqwest 迁移从锁文件移除。 |
+| 服务端锁文件可选数据库链 | rsa 0.9.10 / RUSTSEC-2023-0071 无公告补丁版本；SQLite 服务不启用 MySQL，但锁文件命中仍如实保留。 |
+| 服务端其他平台/构建依赖 | quick-xml 0.39.4（2 条）、users 0.11.0；尚未全部替换。 |
+| 客户端 | idna 0.5、libgit2-sys 0.14.2、quick-xml 0.30 / 0.31 / 0.37.5（共 6 条）、ringbuf 0.3.3、time 0.1.45 / 0.3.36、users 0.11。 |
+| 客户端版本迁移限制 | time 修补需要提高 Rust 最低版本；部分依赖涉及旧 Sciter / 原生库 ABI，未通过改 CI 声明或盲升主版本掩盖兼容风险。 |
 
-## 已落地的客户端补丁与边界
+## 仍不能保证的安全属性
 
-客户端仅修改 `Cargo.lock`，未改动远控、登录、文件传输或 Flutter 桥接代码：
-
-| 依赖 | 修改前 | 最终锁定值 |
-| --- | --- | --- |
-| crossbeam-channel | 0.5.13 | 0.5.17 |
-| openssl / openssl-sys | 0.10.68 / 0.9.104 | 0.10.72 / 0.9.107 |
-| rustls | 0.23.28 | 0.23.46 |
-| quinn-proto | 0.11.15 | 0.11.19 |
-
-这些版本移除对应的 RustSec 命中，其他必要的传递依赖由 Cargo 同步调整；Git 修订号未变。客户端基础库在 Windows MSVC 上完成：
-
-```powershell
-cargo check --locked -p base
-cargo test --locked -p base --lib
-cargo test --locked -p base --lib -- --ignored
-```
-
-普通用例 16 项通过，默认忽略的 3 项 Windows 符号链接权限用例已显式执行并全部通过，共 19 项。覆盖原有的路径逃逸、UNC 路径、NTFS 流、覆盖确认、断点恢复、符号链接与配置键检查。**这不等于完整桌面客户端已编译或远控联调通过。** 构建仍提示既有弃用与 LNK4098 CRT 链接警告，本轮未修改全局链接选项来掩盖警告。
-
-客户端最终审计从 24 条降到 12 条；剩余为 `idna 0.5.0`、`libgit2-sys 0.14.2`、三个旧 `quick-xml` 分支、`ringbuf 0.3.3`、`time 0.1.45 / 0.3.36`、`users 0.11.0`，仍需检查父依赖、平台和实际使用的 API。
-
-### Rust 构建基线不能隐式改变
-
-客户端清单及多数 CI 仍声明 Rust 1.75。审查注册表元数据发现，修复公告所要求的 `time >=0.3.47` 最低需要 Rust 1.88；本轮暂保留原版本并记录 RUSTSEC-2026-0009，未通过修改 CI 或隐藏告警来声称修复。
-
-OpenSSL 特意选择已修复相关公告、且保留 Rust 1.63 最低要求的 0.10.72 / openssl-sys 0.9.107，而非会把该依赖最低要求提升到 1.80 的最新版。`quinn-proto 0.11.19` 与原 0.11.15 均要求 Rust 1.85；这个原有的锁文件/CI 不一致问题也必须后续核对。因此，本轮未声称验证了 Rust 1.75 兼容性。
-
-可选 Tauri UI 的独立锁文件本轮未修改，其初始审计有 9 条命中；不能把服务端或基础库测试作为 UI 的验证结论。
-
-## 认证与部署边界
-
-- 本轮**没有**把开放式中继策略改成账户体系；hbbr 未设置 KEY 时的开放配对行为仍存在。
-- 公钥匹配不是用户身份认证。不能仅因客户端填了服务器公钥，就称服务器只允许企业成员接入。
-- 远程桌面访问另有密码/人工确认等逻辑；允许使用中继不等于允许绕过被控端的访问授权。
-- 只有原生客户端时，不必公开 WebSocket 端口；使用反向代理时，按 `environment-variables.md` 配置可信代理，不能信任整个客户端网段。
-- 未做公网部署、Linux/macOS 原生构建、完整远控联调、发布签名或品牌/Logo 替换。后续品牌改造应复用客户端现有 app-name 与 Logo 资产入口，不批量改写协议、持久化标识或第三方许可证署名。
-
-## 认证与审计日志专项复核
-
-结论：已有连接授权与审计上报基础，但尚不具备完整的强制身份认证、可靠落库与审计留存闭环。以下为源码复核结论，不是对实际生产部署完成度的证明。
-
-### 已有能力
-
-- 服务端在配置非空 KEY 时校验对应打洞/中继请求；客户端已有临时/永久密码、人工确认、2FA、白名单、失败次数限制与会话类型权限检查。
-- 客户端连接记录包含设备、连接、会话标识及认证方式；连接、文件、告警记录带 nonce，具备有限重试机制。nonce 的接收端去重效果须由实际 API 服务实现，不能仅凭发送代码确认。
-- 未配置 API 地址或地址被识别为公共服务时，审计地址返回空；实际接收端可用性仍需验证。
-
-### 尚不完善与具体风险
-
-1. **服务准入不是强制统一身份认证。** KEY 为空时的开放配对策略未改；服务器公钥匹配不等于用户身份认证、角色授权或人员离职后的凭据撤销。
-2. **审计接收端缺口。** 客户端发送至 `/api/audit/conn`、`file`、`alarm`；当前 OSS 服务端源码未发现对应接收和存储路由。未额外部署兼容 API 时，不能声称“已经审计落库”。
-3. **尚无可靠投递保证。** 连接记录使用内存中的无界通道，文件/告警通过异步任务上报；有限重试耗尽后记录错误并放弃。没有在该路径发现持久化待发送队列，断网过久或进程退出仍可能丢记录。
-4. **默认服务端日志不等于持久审计。** hbbs/hbbr 入口默认输出到 stdout；本仓库入口未配置文件落盘、轮转及留存策略。可由部署层采集补齐，但尚未验证生产配置、查询权限或防篡改能力。
-5. **自定义共享 KEY 可能进入日志。** 两个 `get_server_sk` 在 key 非空时完整输出该值；若将其配置为保密的共享访问凭据，日志读取者也可能获得它。完整私钥输入会先被转换为公钥，不能据此误报为“默认输出私钥”；公钥本身也不应被当成保密凭据。
-6. **审计明细及覆盖有边界。** 文件上报最多保留 10 个文件名并记录总数，属于摘要而非逐文件完整清单。权限/配置变更、登录失败各分支、管理员操作、留存和脱敏策略尚未完成端到端覆盖验证。
-
-后续最小补齐顺序：先明确准入策略并避免记录保密 KEY，接通兼容审计 API 与部署日志采集；若要求断网/崩溃后仍不丢审计，再在现有上报链路补持久化重投递，不另造完整认证或 SIEM 框架。
+1. 不是企业 IAM / RBAC，审计共享 token 的持有者可以伪造设备事件；没有按设备签名、不可抵赖、独立防篡改归档或 SIEM 集成。
+2. 异步生产者调度到落盘前仍有崩溃窗口；磁盘损坏/写满、管理员删除、强制断电的目录元数据持久性不能由文件同步完全解决。不是“任何时刻零丢失”或端到端 exactly-once 保证。
+3. 服务端 SQLite / 客户端 outbox 没有自动清理未确认记录，避免为控制空间而静默丢证据。必须配置磁盘监控、访问控制、备份、归档及留存策略；去重窗口取决于保留的数据库记录。
+4. 没有对公网容量、DoS、TLS 网关、证书更新、真实代理部署做压力/渗透测试。不要把本地测试作为对外开放许可。
+5. 品牌、logo、安装包签名与全平台发布尚未在本轮实现；许可证和必要开源声明不能因换品牌被删除。

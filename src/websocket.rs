@@ -21,9 +21,12 @@ pub async fn accept(
         peer_addr = forwarded_addr(addr, request.headers(), &trusted_proxies);
         Ok(response)
     };
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(crate::common::MAX_CONTROL_MESSAGE))
+        .max_frame_size(Some(crate::common::MAX_CONTROL_MESSAGE));
     let stream = timeout(
         Duration::from_secs(10),
-        tokio_tungstenite::accept_hdr_async(stream, callback),
+        tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(config)),
     )
     .await??;
     Ok((stream, peer_addr))
@@ -168,6 +171,30 @@ mod tests {
             assert_eq!(client.next().await.unwrap().unwrap(), payload);
             server.await.unwrap();
         }).await.unwrap();
+    }
+
+    #[hbb_common::tokio::test]
+    async fn oversized_websocket_control_messages_are_rejected() {
+        use hbb_common::{futures_util::{SinkExt, StreamExt}, tokio::net::TcpListener};
+        use tokio_tungstenite::tungstenite::{Error, Message, protocol::frame::{Frame, coding::{Data, OpCode}}};
+        for fragmented in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, addr) = listener.accept().await.unwrap();
+                let (mut socket, _) = accept(stream, addr).await.unwrap();
+                assert!(matches!(socket.next().await.unwrap(), Err(Error::Capacity(_))));
+            });
+            let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}")).await.unwrap();
+            if fragmented {
+                let part = vec![0; crate::common::MAX_CONTROL_MESSAGE / 2 + 1];
+                client.send(Message::Frame(Frame::message(part.clone(), OpCode::Data(Data::Binary), false))).await.unwrap();
+                let _ = client.send(Message::Frame(Frame::message(part, OpCode::Data(Data::Continue), true))).await;
+            } else {
+                let _ = client.send(Message::Binary(vec![0; crate::common::MAX_CONTROL_MESSAGE + 1].into())).await;
+            }
+            timeout(Duration::from_secs(3), server).await.unwrap().unwrap();
+        }
     }
 
     #[hbb_common::tokio::test]

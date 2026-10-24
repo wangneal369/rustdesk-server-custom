@@ -52,6 +52,7 @@ pub async fn start_with_bind(
     port: &str,
     key: &str,
 ) -> ResultType<()> {
+    crate::common::require_service_key(key, &crate::common::get_arg("ALLOW_ANONYMOUS"))?;
     let key = get_server_sk(key)?;
     if let Ok(mut file) = std::fs::File::open(BLACKLIST_FILE) {
         let mut contents = String::new();
@@ -429,7 +430,9 @@ async fn make_pair(
         let (ws_stream, addr) = crate::websocket::accept(stream, addr).await?;
         make_pair_(ws_stream, addr, key, limiter).await;
     } else {
-        make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;
+        let mut stream = FramedStream::from(stream, addr);
+        *stream.codec_mut() = crate::common::control_codec();
+        make_pair_(stream, addr, key, limiter).await;
     }
     Ok(())
 }
@@ -444,6 +447,7 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                     return;
                 }
                 if !rf.uuid.is_empty() {
+                    stream.allow_relay_payload();
                     let mut peer = PEERS.lock().await.remove(&rf.uuid);
                     if let Some(peer) = peer.as_mut() {
                         log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
@@ -592,7 +596,7 @@ fn get_server_sk(key: &str) -> ResultType<String> {
     }
 
     if !key.is_empty() {
-        log::info!("Key: {}", key);
+        log::info!("Access key configured (value redacted)");
     }
 
     Ok(key)
@@ -604,6 +608,7 @@ trait StreamTrait: Send + Sync + 'static {
     async fn send_raw(&mut self, bytes: Bytes) -> ResultType<()>;
     fn is_ws(&self) -> bool;
     fn set_raw(&mut self);
+    fn allow_relay_payload(&mut self);
 }
 
 #[async_trait]
@@ -622,6 +627,10 @@ impl StreamTrait for FramedStream {
 
     fn set_raw(&mut self) {
         self.set_raw();
+    }
+
+    fn allow_relay_payload(&mut self) {
+        self.codec_mut().set_max_packet_length(usize::MAX);
     }
 }
 
@@ -656,4 +665,115 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
     }
 
     fn set_raw(&mut self) {}
+
+    fn allow_relay_payload(&mut self) {
+        let defaults = tungstenite::protocol::WebSocketConfig::default();
+        self.set_config(|config| {
+            config.max_message_size = defaults.max_message_size;
+            config.max_frame_size = defaults.max_frame_size;
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalid_relay_credentials_never_enter_the_pairing_pool() {
+        for ws in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, peer) = listener.accept().await.unwrap();
+                make_pair(stream, peer, "expected-test-key", Limiter::new(1024.0), ws).await.unwrap();
+            });
+            let uuid = uuid::Uuid::new_v4().to_string();
+            let mut request = RendezvousMessage::new();
+            request.set_request_relay(RequestRelay {
+                uuid: uuid.clone(), licence_key: "incorrect-test-key".into(), ..Default::default()
+            });
+            let bytes = request.write_to_bytes().unwrap();
+            if ws {
+                let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}")).await.unwrap();
+                client.send(tungstenite::Message::Binary(bytes.into())).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(3), server).await.unwrap().unwrap();
+                drop(client);
+            } else {
+                let mut client = FramedStream::from(TcpStream::connect(addr).await.unwrap(), addr);
+                client.send_bytes(bytes.into()).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(3), server).await.unwrap().unwrap();
+                drop(client);
+            }
+            assert!(!PEERS.lock().await.contains_key(&uuid));
+        }
+    }
+
+    async fn relay_client(addr: SocketAddr, ws: bool) -> Box<dyn StreamTrait> {
+        if ws {
+            Box::new(tokio_tungstenite::client_async(format!("ws://{addr}"), TcpStream::connect(addr).await.unwrap()).await.unwrap().0)
+        } else {
+            Box::new(FramedStream::from(TcpStream::connect(addr).await.unwrap(), addr))
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_media_payloads_are_not_limited_to_admission_size() {
+        for transports in [[false, false], [true, true], [false, true], [true, false]] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let mut tasks = Vec::new();
+                for ws in transports {
+                    let (stream, peer) = listener.accept().await.unwrap();
+                    tasks.push(tokio::spawn(async move {
+                        make_pair(stream, peer, "expected-test-key", Limiter::new(1024.0 * 1024.0 * 1024.0), ws).await.unwrap();
+                    }));
+                }
+                tasks
+            });
+            let uuid = uuid::Uuid::new_v4().to_string();
+            let mut request = RendezvousMessage::new();
+            request.set_request_relay(RequestRelay {
+                uuid: uuid.clone(), licence_key: "expected-test-key".into(), ..Default::default()
+            });
+            let request = Bytes::from(request.write_to_bytes().unwrap());
+            let mut first = relay_client(addr, transports[0]).await;
+            first.send_raw(request.clone()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !PEERS.lock().await.contains_key(&uuid) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.unwrap();
+            let mut second = relay_client(addr, transports[1]).await;
+            second.send_raw(request).await.unwrap();
+            if !transports[0] && !transports[1] {
+                first.set_raw();
+                second.set_raw();
+            }
+            let payload = Bytes::from(vec![9; crate::common::MAX_CONTROL_MESSAGE + 1]);
+            let outgoing = payload.clone();
+            let sending = tokio::spawn(async move {
+                first.send_raw(outgoing).await.unwrap();
+                first
+            });
+            let received = tokio::time::timeout(Duration::from_secs(3), async {
+                let mut received = Vec::new();
+                while received.len() < payload.len() {
+                    received.extend_from_slice(&second.recv().await.unwrap().unwrap());
+                }
+                received
+            }).await.unwrap();
+            assert_eq!(received.as_slice(), payload.as_ref(), "transports: {:?}", transports);
+            drop(sending.await.unwrap());
+            drop(second);
+            let mut tasks = server.await.unwrap();
+            let relay = tasks.pop().unwrap();
+            tokio::time::timeout(Duration::from_secs(3), relay).await.unwrap().unwrap();
+            let waiting = tasks.pop().unwrap();
+            waiting.abort();
+            let _ = waiting.await;
+            assert!(!PEERS.lock().await.contains_key(&uuid));
+        }
+    }
 }
