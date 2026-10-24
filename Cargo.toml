@@ -53,9 +53,15 @@ reqwest = { version = "0.12", features = ["json", "native-tls", "gzip", "system-
 
 [target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
 reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots", "gzip", "system-proxy"], default-features=false }
+# hbb_common always pulls native-tls; build OpenSSL from source so static musl/cross builds need no system libssl.
+openssl = { version = "0.10", features = ["vendored"] }
 
 [build-dependencies]
 hbb_common = { path = "libs/hbb_common" }
+
+# Build-dependency features resolve separately, so the build script's hbb_common needs vendored OpenSSL too.
+[target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.build-dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
 
 [workspace]
 members = ["libs/hbb_common"]
