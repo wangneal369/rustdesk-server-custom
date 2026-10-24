@@ -178,6 +178,10 @@ jobs:
     needs: 
       - build
       - build-win
+    # custom: releases need a tag and write access; manual runs keep the build artifacts only
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -218,6 +222,7 @@ jobs:
 
     name: Docker push - ${{ matrix.job.name }}
     needs: build
+    if: false # custom: no Docker Hub / upstream GHCR publishing
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -302,6 +307,7 @@ jobs:
 
     name: Docker manifest
     needs: docker
+    if: false # custom: no Docker Hub / upstream GHCR publishing
     runs-on: ubuntu-22.04
 
     steps:
@@ -387,6 +393,7 @@ jobs:
 
     name: Docker push - ${{ matrix.job.name }}
     needs: build
+    if: false # custom: no Docker Hub / upstream GHCR publishing
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -468,6 +475,7 @@ jobs:
 
     name: Docker manifest
     needs: docker
+    if: false # custom: no Docker Hub / upstream GHCR publishing
     runs-on: ubuntu-22.04
 
     steps:
@@ -552,6 +560,8 @@ jobs:
 
     name: debian package - ${{ matrix.job.name }}
     needs: build
+    permissions:
+      contents: write
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -592,7 +602,15 @@ jobs:
           cd debian-build/${{ matrix.job.name }}/
           debuild -i -us -uc -b -a${{ matrix.job.debian_platform }}
 
+      - name: Publish deb artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.job.name }}
+          path: debian-build/*.deb
+          if-no-files-found: error
+
       - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
           draft: true
