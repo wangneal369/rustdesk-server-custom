@@ -220,7 +220,6 @@ impl RendezvousServer {
                 }
             });
         };
-        let audit_task = crate::audit::run(rs.pm.db.clone());
         let main_task = async move {
             loop {
                 log::info!("Start");
@@ -263,7 +262,6 @@ impl RendezvousServer {
         tokio::select!(
             res = main_task => res,
             res = listen_signal => res,
-            res = audit_task => res,
         )
     }
 

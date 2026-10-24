@@ -193,44 +193,21 @@ image, the working directory is `/data`.
 
 ---
 
-## Durable audit receiver
+## Reduced feature scope
 
-| Variable | Default | Description |
-|---|---|---|
-| `AUDIT_LISTEN` | disabled | hbbs-only explicit socket address, recommended `127.0.0.1:21114`; serve through an HTTPS reverse proxy. |
-| `AUDIT_TOKEN` | unset | Required when the listener is enabled: at least 32 non-whitespace ASCII bytes, generated randomly by the operator. Shared write credential, not an admin/read or personnel credential. |
-| `ALLOW_ANONYMOUS` | `N` | Permit an empty service KEY only when explicitly set to `Y`. Applies to both binaries. |
-| `LOG_DIR` | `logs` | Service log directory; see Logging. |
+This build keeps service/runtime logs and peer registration storage, not a
+centralized audit service, account backend or admin dashboard. `AUDIT_LISTEN` and
+`AUDIT_TOKEN` no longer enable a listener. The client no longer uploads audit
+records, even when a custom API server was configured; its audit-token option
+and durable outbox/replay code have been removed.
 
-The writer exposes POST `/api/audit/conn`, `/api/audit/file`, and
-`/api/audit/alarm`, with `Authorization: Bearer <AUDIT_TOKEN>`. JSON bodies are
-limited to 1 MiB and must include a nonempty `id` (at most 253 bytes) and UUID
-`nonce`. Empty 200 means committed or an identical replay; 409 means a reused
-nonce with conflicting content; storage failures return 503. `(device_id,nonce)`
-is unique in the existing SQLite `audit_event` table. No read/admin endpoint is
-added. Back up the DB, restrict file permissions and define retention externally.
-
-Client setup reuses its existing options: set `api-server` to the actual HTTPS
-API base URL and `audit-token` to the same credential, via existing managed
-configuration mechanisms. There is no new settings UI in this patch. Configure
-the proxy to preserve the audit path. A remote plaintext HTTP API is rejected;
-HTTP is permitted only for literal loopback IPs. Audit requests never follow
-redirects or disable certificate verification. If using an existing management
-API instead of this receiver, verify its nonce / response / authentication and
-file-batch compatibility before rollout.
-
-Unconfirmed client records are stored beside its main config at the path
-obtained by replacing the config extension with `.audit-outbox`. Records survive
-restart, retain their nonce, and are removed only after an empty successful
-response. Old URL / malformed records are retained for operator review. Bearer
-tokens are not copied into these records; the token itself uses existing local
-configuration storage, so protect that configuration's ACL. Unsent evidence is
-not automatically evicted: monitor free disk space and archive appropriately.
-
-Never publish the plaintext listener directly to the Internet. If binding a
-non-loopback address for a container gateway, restrict ingress to that gateway.
-See `security-hardening.md` for remaining identity, crash-window and deployment
-limitations.
+Existing audit database tables, old configuration values and `.audit-outbox`
+files are not deleted automatically, but no new audit tables/records are created
+and old outboxes are no longer replayed. Archive or clean them explicitly if
+needed. These changes do not remove peer records or the service log rotation.
+`ALLOW_ANONYMOUS` still defaults to `N`; see Keys and encryption. `LOG_DIR` and
+`RUST_LOG` remain supported; see Logging. Service logs are for troubleshooting,
+not attribution of remote users' file or desktop operations.
 
 ---
 

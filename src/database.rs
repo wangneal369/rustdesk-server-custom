@@ -30,9 +30,6 @@ impl deadpool::managed::Manager for DbPool {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum AuditWrite { Stored, Duplicate, Conflict }
-
 #[derive(Clone)]
 pub struct Database {
     pool: Pool,
@@ -92,35 +89,7 @@ impl Database {
         )
         .execute(self.pool.get().await?.deref_mut())
         .await?;
-        sqlx::raw_sql(
-            "CREATE TABLE IF NOT EXISTS audit_event (
-                seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                device_id TEXT NOT NULL,
-                nonce TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                source_ip TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-                UNIQUE(device_id, nonce)
-            );
-            CREATE INDEX IF NOT EXISTS audit_received_at ON audit_event(received_at);"
-        ).execute(self.pool.get().await?.deref_mut()).await?;
         Ok(())
-    }
-
-    pub(crate) async fn store_audit(
-        &self, device: &str, nonce: &str, kind: &str, source: &str, payload: &str,
-    ) -> ResultType<AuditWrite> {
-        let mut conn = self.pool.get().await?;
-        let inserted = sqlx::query("INSERT INTO audit_event(device_id,nonce,kind,source_ip,payload) VALUES(?,?,?,?,?) ON CONFLICT(device_id,nonce) DO NOTHING")
-            .bind(device).bind(nonce).bind(kind).bind(source).bind(payload)
-            .execute(conn.deref_mut()).await?.rows_affected() > 0;
-        if !inserted {
-            let existing: (String, String) = sqlx::query_as("SELECT kind,payload FROM audit_event WHERE device_id=? AND nonce=?")
-                .bind(device).bind(nonce).fetch_one(conn.deref_mut()).await?;
-            return Ok(if existing == (kind.to_owned(), payload.to_owned()) { AuditWrite::Duplicate } else { AuditWrite::Conflict });
-        }
-        Ok(AuditWrite::Stored)
     }
 
     pub async fn get_peer(&self, id: &str) -> ResultType<Option<Peer>> {
@@ -179,7 +148,7 @@ mod tests {
     use super::*;
     use hbb_common::tokio;
     #[tokio::test]
-    async fn peer_updates_and_audit_records_survive_database_reopen() {
+    async fn peer_updates_and_existing_evidence_survive_database_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite3");
         let path = path.to_str().unwrap();
@@ -191,12 +160,21 @@ mod tests {
         assert_eq!(peer.guid, guid);
         assert_eq!(peer.pk, b"second-key");
         assert_eq!(peer.uuid, b"device");
-        assert_eq!(db.store_audit("device", "nonce", "conn", "127.0.0.1", "{}").await.unwrap(), AuditWrite::Stored);
+        let mut conn = db.pool.get().await.unwrap();
+        let audit_tables: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='audit_event'")
+            .fetch_one(conn.deref_mut()).await.unwrap();
+        assert_eq!(audit_tables, 0, "new deployments must not create an audit store");
+        // Removing the feature must not erase evidence from an earlier deployment.
+        sqlx::raw_sql("CREATE TABLE audit_event(seq INTEGER PRIMARY KEY, payload TEXT NOT NULL); INSERT INTO audit_event VALUES(1, 'preserved-evidence');")
+            .execute(conn.deref_mut()).await.unwrap();
+        drop(conn);
         drop(db);
         let db = Database::new(path).await.unwrap();
         assert_eq!(db.get_peer("renamed").await.unwrap().unwrap().guid, guid);
-        assert_eq!(db.store_audit("device", "nonce", "conn", "127.0.0.2", "{}").await.unwrap(), AuditWrite::Duplicate);
-        assert_eq!(db.store_audit("device", "nonce", "file", "127.0.0.1", "{}").await.unwrap(), AuditWrite::Conflict);
+        let mut conn = db.pool.get().await.unwrap();
+        let payload: String = sqlx::query_scalar("SELECT payload FROM audit_event WHERE seq=1")
+            .fetch_one(conn.deref_mut()).await.unwrap();
+        assert_eq!(payload, "preserved-evidence");
     }
 
     #[test]
